@@ -680,7 +680,10 @@ class RefusalDetector:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
 
-                content = data["choices"][0]["message"]["content"].strip()
+                raw_content = data["choices"][0]["message"].get("content")
+                if not isinstance(raw_content, str):
+                    raise ValueError("judge response missing string content")
+                content = raw_content.strip()
                 # Reasoning models wrap chain-of-thought in <think>…</think>;
                 # strip it so the remaining text is pure JSON. No-op for
                 # non-reasoning responses — the regex just doesn't match.
