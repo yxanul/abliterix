@@ -1,0 +1,102 @@
+# GLM-4.7-Flash FP8 Dynamic on a single L40S (48GB), EGA-enabled run
+#
+# Purpose:
+#   Validate the high-value MoE expert-down LoRA path on GLM-family
+#   compressed-tensors FP8.  This keeps the MLA b-projection spike out of
+#   scope and tests the dimensionally valid expert down_proj lever plus
+#   attention o_proj and router suppression.
+
+non_interactive = true
+
+[model]
+model_id = "unsloth/GLM-4.7-Flash-FP8-Dynamic"
+backend = "vllm"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+trust_remote_code = true
+use_torch_compile = false
+tensor_parallel_size = 1
+gpu_memory_utilization = 0.88
+enable_expert_parallel = false
+enforce_eager = true
+disable_lora = false
+use_in_place_editing = false
+vllm_return_routed_experts = true
+moe_backend = "triton"
+max_model_len = 2048
+max_num_seqs = 16
+vllm_max_lora_rank = 1
+# Expert down_proj LoRA on vLLM MoE needs zero-LoRA gate/up companions so
+# pack_moe sees all three expert projections.
+lora_target_modules = ["o_proj", "down_proj", "gate_proj", "up_proj"]
+
+[inference]
+batch_size = 0
+max_batch_size = 8
+max_gen_tokens = 64
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+n_directions = 1
+orthogonal_projection = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "linear"
+weight_normalization = "none"
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+]
+strength_range = [0.5, 3.0]
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [1.0, 4.0]
+"attn.o_proj" = [0.5, 3.0]
+
+[optimization]
+num_trials = 50
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_glm47_flash_fp8_l40s_ega"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 5.0
+
+[experts]
+ablation_weight_range = [0.0, 0.0]
+
+[detection]
+llm_judge = true
+llm_judge_model = "deepseek/deepseek-v4-flash"
+llm_judge_batch_size = 5
+llm_judge_concurrency = 2
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:100]"
+column = "text"
+
+[target_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:100]"
+column = "text"
+
+[benign_eval_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[50:150]"
+column = "text"
+
+[target_eval_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[50:150]"
+column = "text"
