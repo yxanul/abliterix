@@ -825,8 +825,10 @@ class _AttnMoeLayer(nn.Module):
 class _MLAAttnLike(nn.Module):
     def __init__(self, hidden: int, q_rank: int, kv_rank: int, dtype=torch.float32):
         super().__init__()
-        self.q_b_proj = nn.Linear(q_rank, hidden, bias=False, dtype=dtype)
-        self.kv_b_proj = nn.Linear(kv_rank, hidden, bias=False, dtype=dtype)
+        self.q_a_proj = nn.Linear(hidden, q_rank, bias=False, dtype=dtype)
+        self.q_b_proj = nn.Linear(q_rank, hidden + 2, bias=False, dtype=dtype)
+        self.kv_a_proj_with_mqa = nn.Linear(hidden, kv_rank, bias=False, dtype=dtype)
+        self.kv_b_proj = nn.Linear(kv_rank, hidden + 3, bias=False, dtype=dtype)
         self.o_proj = _RowParallelLike(hidden, hidden, dtype=dtype)
 
 
@@ -903,11 +905,13 @@ def test_locate_attention_finds_qkv_and_o():
     assert attn.kv_size == 8  # 2 heads × 4 head_dim
 
 
-def test_locate_attention_finds_mla_q_b_and_kv_b_without_qkv():
+def test_locate_attention_finds_mla_q_a_and_kv_a_without_qkv():
     decoder = _DecoderLike([_MLAAttnMoeLayer()])
     attn, path = _worker_locate_attention(decoder.layers[0])
     assert attn is not None
     assert path == "self_attn"
+    assert hasattr(attn, "q_a_proj")
+    assert hasattr(attn, "kv_a_proj_with_mqa")
     assert hasattr(attn, "q_b_proj")
     assert hasattr(attn, "kv_b_proj")
     assert not hasattr(attn, "qkv_proj")
@@ -930,7 +934,7 @@ def test_probe_attention_reports_mla_supported_components():
     assert info["n_layers"] == 2
     for row in info["per_layer"]:
         assert row[1] == "self_attn"
-        assert set(row[6]) == {"q_b_proj", "kv_b_proj", "o_proj"}
+        assert set(row[6]) == {"q_a_proj", "kv_a_proj_with_mqa", "o_proj"}
 
 
 def _reference_attn_projection(
@@ -1011,30 +1015,28 @@ def test_apply_attn_o_proj_projects_on_output_axis():
     assert torch.allclose(attn.o_proj.weight.data, expected, atol=1e-5)
 
 
-def test_apply_attn_mla_b_projections_match_reference():
+def test_apply_attn_mla_input_projections_match_reference():
     torch.manual_seed(14)
     worker, decoder = _build_worker_with_mla_attn(num_layers=1, hidden=8)
     attn = decoder.layers[0].self_attn
-    q_ref = attn.q_b_proj.weight.data.clone()
-    kv_ref = attn.kv_b_proj.weight.data.clone()
+    q_ref = attn.q_a_proj.weight.data.clone()
+    kv_ref = attn.kv_a_proj_with_mqa.weight.data.clone()
     v = torch.randn(8)
 
-    expected_q = _reference_attn_projection(
-        q_ref, v, strength=1.1, norm_preserve=True
-    )
+    expected_q = _reference_attn_projection(q_ref, v, strength=1.1, norm_preserve=True)
     expected_kv = _reference_attn_projection(
         kv_ref, v, strength=1.3, norm_preserve=True
     )
     plan = [
         {
             "layer_idx": 0,
-            "component": "q_b_proj",
+            "component": "q_a_proj",
             "v": _save_vec(v),
             "strength": 1.1,
         },
         {
             "layer_idx": 0,
-            "component": "kv_b_proj",
+            "component": "kv_a_proj_with_mqa",
             "v": _save_vec(v),
             "strength": 1.3,
         },
@@ -1044,8 +1046,8 @@ def test_apply_attn_mla_b_projections_match_reference():
 
     assert result["applied"] == 2
     assert result["errors"] == []
-    assert torch.allclose(attn.q_b_proj.weight.data, expected_q, atol=1e-5)
-    assert torch.allclose(attn.kv_b_proj.weight.data, expected_kv, atol=1e-5)
+    assert torch.allclose(attn.q_a_proj.weight.data, expected_q, atol=1e-5)
+    assert torch.allclose(attn.kv_a_proj_with_mqa.weight.data, expected_kv, atol=1e-5)
 
 
 def test_apply_attn_unknown_component_records_error():
@@ -1078,20 +1080,20 @@ def test_attn_backup_and_restore_round_trip():
 def test_attn_backup_and_restore_round_trip_mla():
     worker, decoder = _build_worker_with_mla_attn(num_layers=2)
     attn = decoder.layers[0].self_attn
-    ref_q_b = attn.q_b_proj.weight.data.clone()
-    ref_kv_b = attn.kv_b_proj.weight.data.clone()
+    ref_q_a = attn.q_a_proj.weight.data.clone()
+    ref_kv_a = attn.kv_a_proj_with_mqa.weight.data.clone()
     ref_o = attn.o_proj.weight.data.clone()
 
     assert _worker_backup_attention(worker, [0, 1]) == 2
     assert _worker_backup_attention(worker, [0, 1]) == 0
 
-    attn.q_b_proj.weight.data.zero_()
-    attn.kv_b_proj.weight.data.zero_()
+    attn.q_a_proj.weight.data.zero_()
+    attn.kv_a_proj_with_mqa.weight.data.zero_()
     attn.o_proj.weight.data.zero_()
 
     assert _worker_restore_attention(worker) == 2
-    assert torch.equal(attn.q_b_proj.weight.data, ref_q_b)
-    assert torch.equal(attn.kv_b_proj.weight.data, ref_kv_b)
+    assert torch.equal(attn.q_a_proj.weight.data, ref_q_a)
+    assert torch.equal(attn.kv_a_proj_with_mqa.weight.data, ref_kv_a)
     assert torch.equal(attn.o_proj.weight.data, ref_o)
 
 

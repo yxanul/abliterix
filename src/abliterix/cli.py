@@ -1198,7 +1198,7 @@ def run():
             # reports which attention projections exist. Inject exactly those
             # into cached_components so the optimizer creates matching profiles.
             # This covers both fused-qkv attention and GLM/DeepSeek-style MLA
-            # q_b/kv_b projections without sending q/k/v plans to MLA-only
+            # q_a/kv_a projections without sending q/k/v plans to MLA-only
             # layers.
             if (
                 engine._cached_components is not None

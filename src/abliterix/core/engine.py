@@ -894,15 +894,17 @@ class SteeringEngine:
             _register("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Multi-head Latent Attention (MLA) projections — DeepSeek-V2/V3,
-        # GLM-4.7-Flash, Qwen3-Next. Q goes through a low-rank LoRA pair
-        # (q_a_proj → q_b_proj); KV goes through (kv_a_proj_with_mqa → kv_b_proj).
-        # Steering the *_b_proj outputs is the analogue of steering Q/K/V in
-        # standard attention, since they produce the actual head dimensions.
-        # Norm modules in between (q_a_layernorm, kv_a_layernorm) are skipped.
+        # GLM-4.7-Flash, Qwen3-Next. The refusal direction lives in residual
+        # hidden space, so steer the projections that read that space
+        # (q_a_proj / kv_a_proj_with_mqa). q_b_proj / kv_b_proj operate in
+        # latent/head space and are not geometry-compatible with the vector.
         with suppress(Exception):
-            _register("attn.q_b_proj", layer.self_attn.q_b_proj)  # ty:ignore[possibly-missing-attribute]
+            _register("attn.q_a_proj", layer.self_attn.q_a_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
-            _register("attn.kv_b_proj", layer.self_attn.kv_b_proj)  # ty:ignore[possibly-missing-attribute]
+            _register(
+                "attn.kv_a_proj_with_mqa",
+                layer.self_attn.kv_a_proj_with_mqa,  # ty:ignore[possibly-missing-attribute]
+            )
         # Some MLA implementations (older DeepSeek-V2 ports) skip the q LoRA
         # entirely and project Q in one step via q_proj — already covered above.
 

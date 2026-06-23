@@ -1232,14 +1232,14 @@ class ProjectionCache:
             (r"model\.layers\.(\d+)\.self_attn\.q_proj\.weight$", "attn.q_proj"),
             (r"model\.layers\.(\d+)\.self_attn\.k_proj\.weight$", "attn.k_proj"),
             (r"model\.layers\.(\d+)\.self_attn\.v_proj\.weight$", "attn.v_proj"),
-            # Multi-head Latent Attention (GLM / DeepSeek-style MLA).  These
-            # are the HF-discovered steerable projections for GLM-4.7-Flash;
-            # without them the vLLM safetensors lane silently falls back to
-            # o_proj-only attention steering.
-            (r"model\.layers\.(\d+)\.self_attn\.q_b_proj\.weight$", "attn.q_b_proj"),
+            # Multi-head Latent Attention (GLM / DeepSeek-style MLA). q_a and
+            # kv_a read from the residual stream (d_in == hidden_dim), so the
+            # existing input-side projection branch can steer them. q_b/kv_b
+            # live entirely in latent/head space and are geometry-rejected.
+            (r"model\.layers\.(\d+)\.self_attn\.q_a_proj\.weight$", "attn.q_a_proj"),
             (
-                r"model\.layers\.(\d+)\.self_attn\.kv_b_proj\.weight$",
-                "attn.kv_b_proj",
+                r"model\.layers\.(\d+)\.self_attn\.kv_a_proj_with_mqa\.weight$",
+                "attn.kv_a_proj_with_mqa",
             ),
             # mlp.down_proj: dense MLP (non-MoE layers)
             (r"model\.layers\.(\d+)\.mlp\.down_proj\.weight$", "mlp.down_proj"),
@@ -1397,7 +1397,6 @@ class ProjectionCache:
                     # Strip ".weight" suffix → "model.layers.X.self_attn.o_proj"
                     module_path = wkey.rsplit(".weight", 1)[0]
                     leaf = module_path.split(".")[-1]
-                    target_module_names.add(leaf)
 
                     # Dispatch on which axis matches hidden_dim — see the
                     # corresponding comment in ``ProjectionCache.build`` for
@@ -1419,6 +1418,7 @@ class ProjectionCache:
                         continue
                     del W
 
+                    target_module_names.add(leaf)
                     entries.append(
                         {
                             "vW_all": vW_all,
@@ -1439,6 +1439,9 @@ class ProjectionCache:
                         continue
                     # Single entry (backward-compat with non-MoE path).
                     cache.projections[layer_idx][component] = entries[0]
+
+            if not cache.projections[layer_idx]:
+                del cache.projections[layer_idx]
 
         # Close file handles.
         _open_files.clear()
@@ -1537,9 +1540,11 @@ class ProjectionCache:
                     if module_path is None:
                         continue
 
-                    # Extract leaf name for target_modules.
+                    # Extract leaf name for target_modules. Only add it after
+                    # the geometry gate below accepts the module; otherwise an
+                    # MLA latent/head-space projection can leak into
+                    # target_modules without corresponding adapter weights.
                     leaf = module_path.split(".")[-1]
-                    target_module_names.add(leaf)
 
                     # Dequantise weights and compute projection immediately.
                     # NOTE: we do NOT cache dequantised weights — for MoE models
@@ -1596,6 +1601,8 @@ class ProjectionCache:
                         del W
                         continue
 
+                    target_module_names.add(leaf)
+
                     device = W.device
                     if device not in _sv_by_device:
                         _sv_by_device[device] = steering_vectors.to(device)
@@ -1619,6 +1626,9 @@ class ProjectionCache:
                         "d_in": d_in,
                         "direction": direction,
                     }
+
+            if not cache.projections[layer_idx]:
+                del cache.projections[layer_idx]
 
         cache.target_modules = sorted(target_module_names)
         n_cached = sum(len(v) for v in cache.projections.values())

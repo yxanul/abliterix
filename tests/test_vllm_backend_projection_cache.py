@@ -186,18 +186,24 @@ def test_projection_cache_safetensors_preserves_multi_direction_projection_shape
     assert info["direction"] == "output"
 
 
-def test_projection_cache_safetensors_discovers_glm_mla_b_projections(
+def test_projection_cache_safetensors_discovers_glm_mla_input_projections_and_skips_b(
     tmp_path, monkeypatch
 ):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
 
-    q_b = torch.randn(4, 3)
-    kv_b = torch.randn(4, 5)
+    q_a = torch.randn(3, 4)
+    kv_a = torch.randn(5, 4)
+    q_b = torch.randn(7, 3)
+    kv_b = torch.randn(9, 5)
+    bad_q_proj = torch.randn(3, 5)
     save_file(
         {
+            "model.layers.0.self_attn.q_a_proj.weight": q_a,
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": kv_a,
             "model.layers.0.self_attn.q_b_proj.weight": q_b,
             "model.layers.0.self_attn.kv_b_proj.weight": kv_b,
+            "model.layers.0.self_attn.q_proj.weight": bad_q_proj,
         },
         model_dir / "model.safetensors",
     )
@@ -221,13 +227,17 @@ def test_projection_cache_safetensors_discovers_glm_mla_b_projections(
 
     cache = ProjectionCache.build_from_safetensors(config, steering_vectors)
 
-    assert sorted(cache.projections[0]) == ["attn.kv_b_proj", "attn.q_b_proj"]
-    q_info = cache.projections[0]["attn.q_b_proj"]
-    kv_info = cache.projections[0]["attn.kv_b_proj"]
-    assert q_info["module_path"] == "model.layers.0.self_attn.q_b_proj"
-    assert kv_info["module_path"] == "model.layers.0.self_attn.kv_b_proj"
-    assert q_info["direction"] == "output"
-    assert kv_info["direction"] == "output"
-    torch.testing.assert_close(q_info["vW_all"], q_b)
-    torch.testing.assert_close(kv_info["vW_all"], kv_b)
-    assert cache.target_modules == ["kv_b_proj", "q_b_proj"]
+    assert sorted(cache.projections[0]) == [
+        "attn.kv_a_proj_with_mqa",
+        "attn.q_a_proj",
+    ]
+    q_info = cache.projections[0]["attn.q_a_proj"]
+    kv_info = cache.projections[0]["attn.kv_a_proj_with_mqa"]
+    assert q_info["module_path"] == "model.layers.0.self_attn.q_a_proj"
+    assert kv_info["module_path"] == "model.layers.0.self_attn.kv_a_proj_with_mqa"
+    assert q_info["direction"] == "input"
+    assert kv_info["direction"] == "input"
+    torch.testing.assert_close(q_info["vW_all"], q_a.T)
+    torch.testing.assert_close(kv_info["vW_all"], kv_a.T)
+    assert cache.target_modules == ["kv_a_proj_with_mqa", "q_a_proj"]
+    assert "q_proj" not in cache.target_modules

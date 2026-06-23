@@ -893,8 +893,8 @@ _ATTN_COMPONENTS: tuple[str, ...] = (
     "q_proj",
     "k_proj",
     "v_proj",
-    "q_b_proj",
-    "kv_b_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
     "o_proj",
 )
 
@@ -908,7 +908,7 @@ def _apply_direct_steering_vllm(
     n_layers: int,
     discriminative_layers: set[int] | None,
 ) -> dict:
-    """Apply attention q/k/v/o_proj projection via vLLM TP workers.
+    """Apply attention projection via vLLM TP workers.
 
     Returns the aggregated RPC response from the attention editor.
     """

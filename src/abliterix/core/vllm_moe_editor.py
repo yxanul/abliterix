@@ -1098,7 +1098,7 @@ def _worker_locate_attention(layer_module: Any):
 
     Supported layouts:
       * fused QKV: ``qkv_proj.weight`` + ``q_size`` + ``kv_size``
-      * MLA: ``q_b_proj.weight`` / ``kv_b_proj.weight``
+      * MLA: ``q_a_proj.weight`` / ``kv_a_proj_with_mqa.weight``
 
     ``o_proj.weight`` is optional for discovery but required for ``o_proj``
     edits. Some MLA implementations expose only the latent projections in the
@@ -1129,10 +1129,13 @@ def _attention_supported_components(attn: Any) -> tuple[str, ...]:
         and _weight_shape(attn.qkv_proj) is not None
     ):
         components.extend(["q_proj", "k_proj", "v_proj"])
-    if hasattr(attn, "q_b_proj") and _weight_shape(attn.q_b_proj) is not None:
-        components.append("q_b_proj")
-    if hasattr(attn, "kv_b_proj") and _weight_shape(attn.kv_b_proj) is not None:
-        components.append("kv_b_proj")
+    if hasattr(attn, "q_a_proj") and _weight_shape(attn.q_a_proj) is not None:
+        components.append("q_a_proj")
+    if (
+        hasattr(attn, "kv_a_proj_with_mqa")
+        and _weight_shape(attn.kv_a_proj_with_mqa) is not None
+    ):
+        components.append("kv_a_proj_with_mqa")
     if hasattr(attn, "o_proj") and _weight_shape(attn.o_proj) is not None:
         components.append("o_proj")
     return tuple(components)
@@ -1160,7 +1163,7 @@ def _worker_probe_attention(worker: Any) -> dict[str, Any]:
             continue
         qkv_shape = _weight_shape(getattr(attn, "qkv_proj", None))
         if qkv_shape is None:
-            qkv_shape = _weight_shape(getattr(attn, "q_b_proj", None))
+            qkv_shape = _weight_shape(getattr(attn, "q_a_proj", None))
         o_shape = _weight_shape(getattr(attn, "o_proj", None))
         components = _attention_supported_components(attn)
         per_layer.append(
@@ -1199,8 +1202,8 @@ def _worker_backup_attention(worker: Any, layer_indices: list[int]) -> int:
         entry: dict[str, Any] = {}
         for key, attr in (
             ("qkv", "qkv_proj"),
-            ("q_b", "q_b_proj"),
-            ("kv_b", "kv_b_proj"),
+            ("q_a", "q_a_proj"),
+            ("kv_a", "kv_a_proj_with_mqa"),
             ("o", "o_proj"),
         ):
             module = getattr(attn, attr, None)
@@ -1236,8 +1239,8 @@ def _worker_restore_attention(worker: Any) -> int:
             continue
         for key, attr in (
             ("qkv", "qkv_proj"),
-            ("q_b", "q_b_proj"),
-            ("kv_b", "kv_b_proj"),
+            ("q_a", "q_a_proj"),
+            ("kv_a", "kv_a_proj_with_mqa"),
             ("o", "o_proj"),
         ):
             if key not in pair:
@@ -1300,7 +1303,7 @@ def _worker_apply_attn_batch(
     ``plan`` entries:
       * ``layer_idx`` (int)
       * ``component`` (one of ``"q_proj"``, ``"k_proj"``, ``"v_proj"``,
-        ``"q_b_proj"``, ``"kv_b_proj"``, ``"o_proj"``)
+        ``"q_a_proj"``, ``"kv_a_proj_with_mqa"``, ``"o_proj"``)
       * ``v`` (bytes — torch.save of 1-D hidden-dim float tensor)
       * ``strength`` (float)
 
@@ -1351,7 +1354,7 @@ def _worker_apply_attn_batch(
                 errors.append(f"layer {idx} o_proj: {e}")
             continue
 
-        if component in ("q_b_proj", "kv_b_proj"):
+        if component in ("q_a_proj", "kv_a_proj_with_mqa"):
             module = getattr(attn, component, None)
             weight = getattr(module, "weight", None)
             if weight is None:
@@ -1467,7 +1470,7 @@ class VLLMAttentionEditor:
         if not found:
             print(
                 "  [yellow]VLLMAttentionEditor.probe: no attention modules found "
-                "(expected fused qkv/o_proj or MLA q_b/kv_b/o_proj).[/]"
+                "(expected fused qkv/o_proj or MLA q_a/kv_a/o_proj).[/]"
             )
             self._probed = True
             return
@@ -1504,7 +1507,8 @@ class VLLMAttentionEditor:
         """Apply attention projection for this trial.
 
         ``plan`` — one dict per (layer, component): ``layer_idx``, ``component``
-        (``"q_proj"``/``"k_proj"``/``"v_proj"``/``"o_proj"``), ``v`` (bytes),
+        (``"q_proj"``/``"k_proj"``/``"v_proj"``/``"q_a_proj"``/
+        ``"kv_a_proj_with_mqa"``/``"o_proj"``), ``v`` (bytes),
         ``strength`` (float).
         """
         if not self._probed:
