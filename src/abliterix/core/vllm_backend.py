@@ -231,7 +231,15 @@ def _build_llm_kwargs(
         disable_custom_all_reduce=_should_disable_custom_all_reduce(
             config.model.disable_custom_all_reduce
         ),
-        enable_prefix_caching=not bool(config.model.use_in_place_editing),
+        # Per-trial abliterix LoRA adapters are synthetic and change every
+        # optimizer trial. vLLM's prefix cache is keyed by the LoRA request
+        # identity, not the adapter file contents, so keeping it on for this
+        # path can replay prefill blocks from an earlier trial when the prompt
+        # set is reused. In-place edit paths already need the cache off for the
+        # same reason: weights change between requests.
+        enable_prefix_caching=bool(
+            config.model.disable_lora and not config.model.use_in_place_editing
+        ),
     )
 
     attention_backend = _resolve_attention_backend(
@@ -411,8 +419,11 @@ class VLLMGenerator:
         self._adapter_dir = os.path.join(
             tempfile.mkdtemp(prefix="abliterix_lora_", dir=tmpfs_base), "current"
         )
-        # Use a fixed adapter ID so vLLM treats reloads as the same adapter.
-        self._adapter_id = 1
+        # vLLM caches LoRA weights by integer ID/name. Abliterix writes a new
+        # synthetic adapter every trial, so each saved adapter must get a fresh
+        # request identity; otherwise vLLM may reuse the first loaded weights.
+        self._adapter_id = 0
+        self._adapter_name = "steering_0"
         self._lora_target_modules: list[str] = []  # set during projection cache
 
         # MoE router suppression is attached lazily by cli.py once the HF
@@ -752,8 +763,26 @@ class VLLMGenerator:
         with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
             json.dump(adapter_config, f)
 
+        self._adapter_id += 1
+        self._adapter_name = f"steering_{self._adapter_id}"
         self._lora_target_modules = target_modules
+        try:
+            self.llm.reset_prefix_cache()
+        except Exception:
+            pass
         return adapter_dir
+
+    def _lora_request_args(self, adapter_path: str) -> dict[str, Any]:
+        return {
+            "lora_name": self._adapter_name,
+            "lora_int_id": self._adapter_id,
+            "lora_path": adapter_path,
+        }
+
+    def _make_lora_request(self, adapter_path: str):
+        from vllm.lora.request import LoRARequest
+
+        return LoRARequest(**self._lora_request_args(adapter_path))
 
     # ------------------------------------------------------------------
     # Generation methods (mirrors SteeringEngine API)
@@ -790,13 +819,7 @@ class VLLMGenerator:
 
         lora_req = None
         if adapter_path and not self._lora_disabled:
-            from vllm.lora.request import LoRARequest
-
-            lora_req = LoRARequest(
-                f"steering_{self._adapter_id}",
-                self._adapter_id,
-                adapter_path,
-            )
+            lora_req = self._make_lora_request(adapter_path)
 
         outputs = self.llm.generate(prompts, params, lora_request=lora_req)
 
@@ -880,13 +903,7 @@ class VLLMGenerator:
 
         lora_req = None
         if adapter_path and not self._lora_disabled:
-            from vllm.lora.request import LoRARequest
-
-            lora_req = LoRARequest(
-                f"steering_{self._adapter_id}",
-                self._adapter_id,
-                adapter_path,
-            )
+            lora_req = self._make_lora_request(adapter_path)
 
         outputs = self.llm.generate(prompts, params, lora_request=lora_req)
 
@@ -1025,13 +1042,7 @@ class VLLMGenerator:
 
         lora_req = None
         if adapter_path and not self._lora_disabled:
-            from vllm.lora.request import LoRARequest
-
-            lora_req = LoRARequest(
-                f"steering_{self._adapter_id}",
-                self._adapter_id,
-                adapter_path,
-            )
+            lora_req = self._make_lora_request(adapter_path)
 
         outputs = self.llm.generate(full_prompts, params, lora_request=lora_req)
 

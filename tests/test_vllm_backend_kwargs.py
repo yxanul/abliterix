@@ -243,6 +243,7 @@ def test_build_llm_kwargs_default_recipe():
     assert kwargs["limit_mm_per_prompt"] == {"image": 0, "video": 0, "audio": 0}
     assert kwargs["enable_lora"] is True
     assert kwargs["max_lora_rank"] == 16
+    assert kwargs["enable_prefix_caching"] is False
     assert "kv_cache_dtype" not in kwargs
     assert "quantization" not in kwargs
     # PR #21 review item 2: enforce_eager kwarg must NOT be passed —
@@ -386,6 +387,50 @@ def test_build_llm_kwargs_disable_lora_drops_lora_kwargs():
     assert "max_lora_rank" not in kwargs
     assert "max_loras" not in kwargs
     assert "lora_target_modules" not in kwargs
+
+
+def test_build_llm_kwargs_prefix_cache_allowed_without_dynamic_lora():
+    """With LoRA disabled and no in-place edits, vLLM may safely reuse prefix
+    cache blocks because the model weights are stable across requests."""
+    cfg = _make_config(disable_lora=True, use_in_place_editing=False)
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        with patch(
+            "abliterix.core.vllm_backend.torch.cuda.is_available", return_value=True
+        ):
+            with patch(
+                "abliterix.core.vllm_backend.torch.cuda.get_device_capability",
+                return_value=(9, 0),
+            ):
+                kwargs = _build_llm_kwargs(
+                    cfg,
+                    model_arch="LlamaForCausalLM",
+                    is_fp8=False,
+                    kv_cache_dtype=None,
+                    lora_max_rank=16,
+                )
+    assert kwargs["enable_prefix_caching"] is True
+
+
+def test_build_llm_kwargs_prefix_cache_disabled_for_in_place_edits():
+    """In-place edits mutate model weights between trials, so cached prompt
+    activations would be stale even when LoRA support itself is disabled."""
+    cfg = _make_config(disable_lora=True, use_in_place_editing=True)
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        with patch(
+            "abliterix.core.vllm_backend.torch.cuda.is_available", return_value=True
+        ):
+            with patch(
+                "abliterix.core.vllm_backend.torch.cuda.get_device_capability",
+                return_value=(9, 0),
+            ):
+                kwargs = _build_llm_kwargs(
+                    cfg,
+                    model_arch="LlamaForCausalLM",
+                    is_fp8=False,
+                    kv_cache_dtype=None,
+                    lora_max_rank=16,
+                )
+    assert kwargs["enable_prefix_caching"] is False
 
 
 def test_build_llm_kwargs_fp8_propagates():
