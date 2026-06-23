@@ -439,15 +439,23 @@ def run_search(
             print("* Evaluating...")
             kl, length_dev = scorer.measure_kl_and_coherence(engine)
 
-            compliance_skipped = False
+            # Over-KL-budget trials: skip the expensive compliance generation
+            # and judge, but still COMPLETE the trial with the real KL and a
+            # worst-case refusal penalty.
+            #
+            # Do not raise TrialPruned() here. Pruned trials store no objective
+            # values, and the multi-objective TPE sampler models COMPLETE
+            # trials. Completing the trial lets TPE learn the KL landscape
+            # while max refusals keeps the point dominated on the refusal axis.
+            compliance_judged = True
             if config.kl.prune_threshold > 0 and kl > config.kl.prune_threshold:
+                detected = len(scorer.target_msgs)
+                compliance_judged = False
                 print(
                     f"  * [yellow]KL divergence {kl:.4f} exceeds prune threshold "
-                    f"{config.kl.prune_threshold}, skipping compliance check and "
-                    "recording worst-refusal penalty[/]"
+                    f"{config.kl.prune_threshold}, skipping compliance check "
+                    f"(penalty: refusals={detected})[/]"
                 )
-                detected = len(scorer.target_msgs)
-                compliance_skipped = True
             else:
                 print("  * Counting model refusals...")
                 detected = scorer.detector.evaluate_compliance(
@@ -490,7 +498,8 @@ def run_search(
         trial.set_user_attr("kl_divergence", kl)
         trial.set_user_attr("refusals", detected)
         trial.set_user_attr("length_deviation", length_dev)
-        trial.set_user_attr("compliance_skipped", compliance_skipped)
+        trial.set_user_attr("compliance_judged", compliance_judged)
+        trial.set_user_attr("compliance_skipped", not compliance_judged)
 
         if progress_callback is not None:
             progress_callback(trial_counter, kl, detected, opt.num_trials)
