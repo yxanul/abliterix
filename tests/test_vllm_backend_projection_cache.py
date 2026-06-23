@@ -74,6 +74,20 @@ def test_projection_cache_builds_rank_k_lora_for_multi_direction_vectors():
     assert lora_b.shape == (4, 3)
 
 
+def test_projection_cache_steerable_components_excludes_zero_companions():
+    cache = ProjectionCache()
+    cache.projections = {
+        0: {
+            "attn.o_proj": {"vW_all": torch.empty(2, 3)},
+            "mlp.down_proj": {"experts": []},
+            "moe.expert_gate": {"companions": []},
+            "moe.expert_up": {"companions": []},
+        }
+    }
+
+    assert cache.steerable_components() == ["attn.o_proj", "mlp.down_proj"]
+
+
 def test_projection_cache_safetensors_dequants_compressed_tensors_weight_scale(
     tmp_path, monkeypatch
 ):

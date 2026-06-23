@@ -1116,6 +1116,21 @@ class ProjectionCache:
             return steering_vectors @ W
         return steering_vectors @ W.t()
 
+    def steerable_components(self) -> list[str]:
+        """Components that should receive optimizer strength profiles.
+
+        vLLM MoE adapters need zero-LoRA gate/up companion entries so
+        ``pack_moe`` sees all expert projections. Those entries are adapter
+        plumbing, not steering levers, and should not become Optuna dimensions.
+        """
+        components: set[str] = set()
+        for layer in self.projections.values():
+            for component, info in layer.items():
+                if isinstance(info, dict) and "companions" in info:
+                    continue
+                components.add(component)
+        return sorted(components)
+
     @staticmethod
     def build_from_safetensors(
         config: "AbliterixConfig",

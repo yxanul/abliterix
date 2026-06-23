@@ -1173,11 +1173,7 @@ def run():
                         max(projection_cache.projections.keys()) + 1
                     )
                     engine._cached_components = sorted(
-                        {
-                            comp
-                            for layer in projection_cache.projections.values()
-                            for comp in layer
-                        }
+                        projection_cache.steerable_components()
                     )
                 else:
                     engine._cached_n_layers = int(vectors.shape[0] - 1)
