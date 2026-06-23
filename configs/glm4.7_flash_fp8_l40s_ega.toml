@@ -73,7 +73,7 @@ ablation_weight_range = [0.0, 0.0]
 [detection]
 llm_judge = true
 llm_judge_model = "deepseek/deepseek-v4-flash"
-llm_judge_reasoning_budget = 512
+llm_judge_reasoning_budget = 2048
 llm_judge_batch_size = 5
 llm_judge_concurrency = 2
 
