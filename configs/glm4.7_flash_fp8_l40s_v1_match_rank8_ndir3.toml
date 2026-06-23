@@ -1,0 +1,89 @@
+# GLM-4.7-Flash FP8 Dynamic on a single L40S (48GB)
+#
+# Separate rank/subspace test for the v1-match vLLM lane.
+# Keeps the same search/data surface as glm4.7_flash_fp8_l40s_v1_match.toml
+# but gives vLLM LoRA enough rank headroom for three refusal directions.
+
+non_interactive = true
+
+[model]
+model_id = "unsloth/GLM-4.7-Flash-FP8-Dynamic"
+backend = "vllm"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+trust_remote_code = true
+use_torch_compile = false
+tensor_parallel_size = 1
+gpu_memory_utilization = 0.88
+enable_expert_parallel = false
+enforce_eager = true
+disable_lora = false
+use_in_place_editing = false
+vllm_return_routed_experts = true
+moe_backend = "triton"
+max_model_len = 2048
+max_num_seqs = 16
+vllm_max_lora_rank = 8
+
+[inference]
+batch_size = 0
+max_batch_size = 8
+max_gen_tokens = 150
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+n_directions = 3
+orthogonal_projection = true
+discriminative_layer_selection = false
+decay_kernel = "linear"
+weight_normalization = "none"
+strength_range = [1.0, 10.0]
+
+[optimization]
+num_trials = 50
+num_warmup_trials = 15
+checkpoint_dir = "checkpoints_glm47_flash_fp8_l40s_v1_match_rank8_ndir3"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 5.0
+
+[experts]
+max_suppress = 30
+router_bias_range = [-10.0, 0.0]
+ablation_weight_range = [0.0, 5.0]
+
+[detection]
+llm_judge = true
+llm_judge_model = "deepseek/deepseek-v4-flash"
+llm_judge_reasoning_budget = 2048
+llm_judge_batch_size = 5
+llm_judge_concurrency = 2
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "datasets/good_500"
+split = "train[:400]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_500"
+split = "train[:400]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_500"
+split = "train[400:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_500"
+split = "train[400:]"
+column = "prompt"

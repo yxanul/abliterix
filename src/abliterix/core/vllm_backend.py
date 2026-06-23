@@ -1078,15 +1078,43 @@ class ProjectionCache:
     """
 
     def __init__(self):
-        # projections[layer_idx][component_name] = {
-        #     "vW": Tensor (hidden_dim,) or (d_in,),  # v @ W for per-layer vector
-        #     "module_path": str,  # full path for PEFT state dict
-        #     "d_out": int,
-        #     "d_in": int,
-        # }
+        # projections[layer_idx][component_name]["vW_all"] stores the projection
+        # for either all layer vectors, shape (layers+1, d), or all
+        # multi-directions, shape (n_dirs, layers+1, d).
         self.projections: dict[int, dict[str, dict[str, Any]]] = {}
         self.steering_vectors: Tensor | None = None
         self.target_modules: list[str] = []
+
+    @staticmethod
+    def _hidden_dim(steering_vectors: Tensor) -> int:
+        """Return residual-stream dimension for 2-D or multi-direction vectors."""
+        return int(steering_vectors.shape[-1])
+
+    @staticmethod
+    def _project_all_vectors(
+        steering_vectors: Tensor,
+        W: Tensor,
+        *,
+        direction: str,
+    ) -> Tensor:
+        """Project every cached vector through ``W``.
+
+        ``steering_vectors`` is either ``(layers+1, hidden)`` or
+        ``(n_dirs, layers+1, hidden)``.  The returned tensor preserves those
+        leading dimensions and replaces ``hidden`` with the projected axis.
+        """
+        if steering_vectors.ndim == 3:
+            n_dirs, n_vec, hidden = steering_vectors.shape
+            flat = steering_vectors.reshape(n_dirs * n_vec, hidden)
+            if direction == "output":
+                projected = flat @ W
+            else:
+                projected = flat @ W.t()
+            return projected.reshape(n_dirs, n_vec, projected.shape[-1])
+
+        if direction == "output":
+            return steering_vectors @ W
+        return steering_vectors @ W.t()
 
     @staticmethod
     def build_from_safetensors(
@@ -1339,7 +1367,7 @@ class ProjectionCache:
 
                     W = W.view(W.shape[0], -1)
                     d_out, d_in = W.shape
-                    hidden_dim = sv.shape[1]
+                    hidden_dim = ProjectionCache._hidden_dim(sv)
 
                     # Derive the module path for PEFT state dict.
                     # Strip ".weight" suffix → "model.layers.X.self_attn.o_proj"
@@ -1352,12 +1380,16 @@ class ProjectionCache:
                     # the math.
                     if d_out == hidden_dim:
                         direction = "output"
-                        # (n_vec, d_out) @ (d_out, d_in) = (n_vec, d_in)
-                        vW_all = (sv @ W).cpu()
+                        # (..., d_out) @ (d_out, d_in) = (..., d_in)
+                        vW_all = ProjectionCache._project_all_vectors(
+                            sv, W, direction=direction
+                        ).cpu()
                     elif d_in == hidden_dim:
                         direction = "input"
-                        # (n_vec, d_in) @ (d_in, d_out) = (n_vec, d_out)
-                        vW_all = (sv @ W.t()).cpu()
+                        # (..., d_in) @ (d_in, d_out) = (..., d_out)
+                        vW_all = ProjectionCache._project_all_vectors(
+                            sv, W, direction=direction
+                        ).cpu()
                     else:
                         del W
                         continue
@@ -1516,7 +1548,7 @@ class ProjectionCache:
 
                     W = W.view(W.shape[0], -1)
                     d_out, d_in = W.shape[0], W.shape[1]
-                    hidden_dim = steering_vectors.shape[1]
+                    hidden_dim = ProjectionCache._hidden_dim(steering_vectors)
 
                     # Determine projection direction based on which axis of W
                     # matches hidden_dim:
@@ -1543,11 +1575,15 @@ class ProjectionCache:
                         _sv_by_device[device] = steering_vectors.to(device)
                     sv_dev = _sv_by_device[device]
                     if direction == "output":
-                        # (n_vec, d_out) @ (d_out, d_in) = (n_vec, d_in)
-                        vW_all = (sv_dev @ W).cpu()
+                        # (..., d_out) @ (d_out, d_in) = (..., d_in)
+                        vW_all = ProjectionCache._project_all_vectors(
+                            sv_dev, W, direction=direction
+                        ).cpu()
                     else:
-                        # (n_vec, d_in=hidden_dim) @ (d_in, d_out) = (n_vec, d_out)
-                        vW_all = (sv_dev @ W.t()).cpu()
+                        # (..., d_in=hidden_dim) @ (d_in, d_out) = (..., d_out)
+                        vW_all = ProjectionCache._project_all_vectors(
+                            sv_dev, W, direction=direction
+                        ).cpu()
                     del W  # free immediately to avoid OOM on large MoE models
 
                     cache.projections[layer_idx][component] = {
@@ -1603,7 +1639,7 @@ class ProjectionCache:
         global_frac: float = 0.0
         global_norm: float = 1.0
 
-        if vector_index is not None:
+        if vector_index is not None and sv.ndim != 3:
             global_frac, integral = math.modf(vector_index + 1)
             global_idx_a = int(integral)
             v_unnorm = (1 - global_frac) * sv[global_idx_a] + global_frac * sv[
@@ -1621,7 +1657,8 @@ class ProjectionCache:
             """Compute (lora_A, lora_B) for a single real-steering module.
 
             Dispatches on ``info["direction"]`` to produce the correct rank-1
-            update for either residual-output (o_proj, down_proj) or
+            (or rank-k multi-direction) update for either residual-output
+            (o_proj, down_proj) or
             residual-input (q/k/v_proj, gate/up_proj) modules. See
             :meth:`ProjectionCache.build` for the math.
             """
@@ -1630,7 +1667,22 @@ class ProjectionCache:
             # field — assume output-side, matching the old behaviour.
             direction = info.get("direction", "output")
 
-            if global_vector is not None:
+            if sv.ndim == 3:
+                # Multi-direction mode: emit one LoRA rank per refusal
+                # direction for this layer. This represents the sum of k
+                # independent orthogonal-projection deltas:
+                #   ΔW = -s * Σ_i v_i (v_i^T W)      (output-side)
+                #   ΔW = -s * Σ_i (W v_i) v_i^T      (input-side)
+                v = F.normalize(sv[:, layer_idx + 1, :], p=2, dim=1)
+                vW = vW_all[:, layer_idx + 1, :]
+                if direction == "output":
+                    lora_A = vW.reshape(vW.shape[0], -1)
+                    lora_B = (-strength * v[:, : info["d_out"]]).T.contiguous()
+                else:
+                    lora_A = v[:, : info["d_in"]].reshape(v.shape[0], -1)
+                    lora_B = (-strength * vW).T.contiguous()
+                return lora_A, lora_B
+            elif global_vector is not None:
                 v = global_vector
                 vW = (
                     (1 - global_frac) * vW_all[global_idx_a]
