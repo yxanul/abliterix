@@ -674,17 +674,18 @@ class RefusalDetector:
             entries.append(f"{j}. Question: {q[:200]}\n   Response: {r[:2000]}")
 
         # Reasoning-model judges (MiniMax, DeepSeek-R1, QwQ, Kimi-reasoning,
-        # local reasoners, …) emit hidden chain-of-thought tokens before the
-        # JSON answer; reserve extra max_tokens so the reply isn't truncated.
-        # Only applied on custom endpoints — OpenRouter's default slug is a
-        # non-reasoning model and we don't want to burn tokens for nothing.
+        # local reasoners, …) emit hidden reasoning tokens before the JSON
+        # answer; reserve extra max_tokens so the reply isn't truncated.
+        # OpenRouter keeps the historical non-reasoning default unless an
+        # explicit budget is configured for a reasoning slug.
         # Set llm_judge_reasoning_budget=0 to opt out for non-reasoning custom
         # endpoints (e.g. a local Qwen2.5 instance).
         max_tokens = len(uncached) * 5 + 50
-        if not is_openrouter:
-            budget = self.config.detection.llm_judge_reasoning_budget
-            if budget is None:
-                budget = 256 + 32 * len(uncached)
+        budget = self.config.detection.llm_judge_reasoning_budget
+        if budget is not None:
+            max_tokens += budget
+        elif not is_openrouter:
+            budget = 256 + 32 * len(uncached)
             max_tokens += budget
 
         request_body: dict = {
@@ -736,6 +737,7 @@ class RefusalDetector:
             return items
 
         for attempt in range(3):
+            response_audit: dict | None = None
             try:
                 req = urllib.request.Request(
                     endpoint_url,
@@ -746,7 +748,26 @@ class RefusalDetector:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
 
-                raw_content = data["choices"][0]["message"].get("content")
+                choice0 = data["choices"][0]
+                message0 = choice0.get("message") or {}
+                raw_content = message0.get("content")
+                reasoning = message0.get("reasoning")
+                response_audit = {
+                    "id": data.get("id"),
+                    "model": data.get("model"),
+                    "finish_reason": choice0.get("finish_reason"),
+                    "usage": data.get("usage"),
+                    "raw_content": raw_content
+                    if isinstance(raw_content, str)
+                    else None,
+                    "content_type": type(raw_content).__name__,
+                    "content_present": isinstance(raw_content, str)
+                    and bool(raw_content),
+                    "reasoning_present": isinstance(reasoning, str) and bool(reasoning),
+                    "reasoning_chars": len(reasoning)
+                    if isinstance(reasoning, str)
+                    else 0,
+                }
                 if not isinstance(raw_content, str):
                     raise ValueError("judge response missing string content")
                 content = raw_content.strip()
@@ -783,7 +804,7 @@ class RefusalDetector:
                 labels = [str(c) for c in classifications]
                 api_res = [c.upper().startswith("R") for c in labels]
 
-                choice0 = data.get("choices", [{}])[0]
+                response_audit["json_content"] = content
                 self._write_judge_audit(
                     {
                         "event": "llm_judge_api_call",
@@ -793,14 +814,7 @@ class RefusalDetector:
                         "is_openrouter": is_openrouter,
                         "model": self.config.detection.llm_judge_model,
                         "request": request_body,
-                        "response": {
-                            "id": data.get("id"),
-                            "model": data.get("model"),
-                            "finish_reason": choice0.get("finish_reason"),
-                            "usage": data.get("usage"),
-                            "raw_content": raw_content,
-                            "json_content": content,
-                        },
+                        "response": response_audit,
                         "parsed_labels": labels,
                         "raw_parsed_labels": raw_classifications,
                         "uncached_indices": uncached,
@@ -818,23 +832,24 @@ class RefusalDetector:
 
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 if attempt < 2:
-                    self._write_judge_audit(
-                        {
-                            "event": "llm_judge_api_call",
-                            "status": "retryable_error",
-                            "attempt": attempt + 1,
-                            "endpoint_url": endpoint_url,
-                            "is_openrouter": is_openrouter,
-                            "model": self.config.detection.llm_judge_model,
-                            "request": request_body,
-                            "error": {
-                                "type": type(exc).__name__,
-                                "message": str(exc),
-                            },
-                            "uncached_indices": uncached,
-                            "items": _audit_items(),
-                        }
-                    )
+                    audit_record = {
+                        "event": "llm_judge_api_call",
+                        "status": "retryable_error",
+                        "attempt": attempt + 1,
+                        "endpoint_url": endpoint_url,
+                        "is_openrouter": is_openrouter,
+                        "model": self.config.detection.llm_judge_model,
+                        "request": request_body,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "uncached_indices": uncached,
+                        "items": _audit_items(),
+                    }
+                    if response_audit is not None:
+                        audit_record["response"] = response_audit
+                    self._write_judge_audit(audit_record)
                     time.sleep(2 ** (attempt + 1))
                 else:
                     # Last-resort graceful fallback: default every item in the
@@ -848,27 +863,28 @@ class RefusalDetector:
                     )
                     fallback_labels = ["R"] * len(uncached)
                     fallback_verdicts = [True] * len(uncached)
-                    self._write_judge_audit(
-                        {
-                            "event": "llm_judge_api_call",
-                            "status": "fallback_refusal",
-                            "attempt": attempt + 1,
-                            "endpoint_url": endpoint_url,
-                            "is_openrouter": is_openrouter,
-                            "model": self.config.detection.llm_judge_model,
-                            "request": request_body,
-                            "error": {
-                                "type": type(exc).__name__,
-                                "message": str(exc),
-                            },
-                            "parsed_labels": fallback_labels,
-                            "uncached_indices": uncached,
-                            "items": _audit_items(
-                                fallback_labels,
-                                fallback_verdicts,
-                            ),
-                        }
-                    )
+                    audit_record = {
+                        "event": "llm_judge_api_call",
+                        "status": "fallback_refusal",
+                        "attempt": attempt + 1,
+                        "endpoint_url": endpoint_url,
+                        "is_openrouter": is_openrouter,
+                        "model": self.config.detection.llm_judge_model,
+                        "request": request_body,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "parsed_labels": fallback_labels,
+                        "uncached_indices": uncached,
+                        "items": _audit_items(
+                            fallback_labels,
+                            fallback_verdicts,
+                        ),
+                    }
+                    if response_audit is not None:
+                        audit_record["response"] = response_audit
+                    self._write_judge_audit(audit_record)
                     for j, orig_idx in enumerate(uncached):
                         results[orig_idx] = True  # True = refusal
                         if self._cache is not None:

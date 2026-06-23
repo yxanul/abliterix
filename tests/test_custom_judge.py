@@ -271,9 +271,20 @@ def test_openrouter_request_skips_reasoning_budget(monkeypatch):
     assert captured["body"]["max_tokens"] == 55
 
 
-def test_openrouter_judge_audit_log_records_request_and_answer(
-    monkeypatch, tmp_path
-):
+def test_openrouter_request_honors_explicit_reasoning_budget(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+    config = AbliterixConfig(detection={"llm_judge_reasoning_budget": 512})
+    detector = RefusalDetector(config)
+    detector._cache = None
+    detector._audit_log = None
+
+    captured: dict = {}
+    with _patch_urlopen(_judge_response(["R"]), captured):
+        detector._query_judge_api([("q", "r")])
+    assert captured["body"]["max_tokens"] == 567
+
+
+def test_openrouter_judge_audit_log_records_request_and_answer(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret-key")
     config = AbliterixConfig(
         optimization={"checkpoint_dir": str(tmp_path)},
@@ -310,6 +321,56 @@ def test_openrouter_judge_audit_log_records_request_and_answer(
     assert row["items"][0]["is_refusal"] is True
     assert row["items"][1]["label"] == "C"
     assert row["items"][1]["is_refusal"] is False
+
+
+def test_openrouter_judge_audit_logs_missing_content_response_metadata(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret-key")
+    config = AbliterixConfig(
+        optimization={"checkpoint_dir": str(tmp_path)},
+        detection={"llm_judge_model": "deepseek/deepseek-v4-flash"},
+    )
+    detector = RefusalDetector(config)
+    detector._cache = None
+
+    payload = {
+        "id": "chatcmpl-test",
+        "model": "deepseek/deepseek-v4-flash",
+        "usage": {"completion_tokens": 75},
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "hidden reasoning text",
+                },
+            }
+        ],
+    }
+    captured: dict = {}
+    with _patch_urlopen(json.dumps(payload).encode("utf-8"), captured):
+        result = detector._query_judge_api([("q", "r")])
+
+    assert result == [True]
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "judge_audit.jsonl").read_text().splitlines()
+    ]
+    assert [row["status"] for row in rows] == [
+        "retryable_error",
+        "retryable_error",
+        "fallback_refusal",
+    ]
+    response = rows[0]["response"]
+    assert response["finish_reason"] == "length"
+    assert response["content_present"] is False
+    assert response["content_type"] == "NoneType"
+    assert response["reasoning_present"] is True
+    assert response["reasoning_chars"] == len("hidden reasoning text")
+    assert response["raw_content"] is None
+    assert "hidden reasoning text" not in (tmp_path / "judge_audit.jsonl").read_text()
 
 
 # --- MiniMax preset --------------------------------------------------------

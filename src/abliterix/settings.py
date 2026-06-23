@@ -1326,10 +1326,11 @@ class DetectionConfig(BaseModel):
             "Extra max_tokens reserved for a reasoning-model judge's hidden "
             "chain-of-thought (e.g. MiniMax, DeepSeek-V3.2-Speciale / reasoner, "
             "Qwen3-Thinking, Kimi K2-Thinking, GPT-5.4-Thinking).  "
-            "Only applied when llm_judge_base_url is set.  When None (default), "
-            "auto-scales with batch size as 256 + 32 * batch_size.  Set an "
-            "explicit int to override (e.g. 1024 for very verbose reasoners, "
-            "0 to disable entirely for non-reasoning models)."
+            "When None (default), OpenRouter uses no extra budget and custom "
+            "endpoints auto-scale with batch size as 256 + 32 * batch_size.  "
+            "Set an explicit int to override for either path (e.g. 1024 for "
+            "very verbose reasoners, 0 to disable entirely for non-reasoning "
+            "custom models)."
         ),
     )
 
