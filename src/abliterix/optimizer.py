@@ -439,20 +439,22 @@ def run_search(
             print("* Evaluating...")
             kl, length_dev = scorer.measure_kl_and_coherence(engine)
 
-            # Early pruning for excessively damaged models.
+            compliance_skipped = False
             if config.kl.prune_threshold > 0 and kl > config.kl.prune_threshold:
                 print(
                     f"  * [yellow]KL divergence {kl:.4f} exceeds prune threshold "
-                    f"{config.kl.prune_threshold}, skipping compliance check[/]"
+                    f"{config.kl.prune_threshold}, skipping compliance check and "
+                    "recording worst-refusal penalty[/]"
                 )
-                raise TrialPruned()
-
-            print("  * Counting model refusals...")
-            detected = scorer.detector.evaluate_compliance(
-                engine,
-                scorer.target_msgs,
-            )
-            print(f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}")
+                detected = len(scorer.target_msgs)
+                compliance_skipped = True
+            else:
+                print("  * Counting model refusals...")
+                detected = scorer.detector.evaluate_compliance(
+                    engine,
+                    scorer.target_msgs,
+                )
+                print(f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}")
 
             objectives = scorer._compute_objectives(kl, detected, length_dev)
         finally:
@@ -488,6 +490,7 @@ def run_search(
         trial.set_user_attr("kl_divergence", kl)
         trial.set_user_attr("refusals", detected)
         trial.set_user_attr("length_deviation", length_dev)
+        trial.set_user_attr("compliance_skipped", compliance_skipped)
 
         if progress_callback is not None:
             progress_callback(trial_counter, kl, detected, opt.num_trials)
