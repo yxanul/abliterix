@@ -539,7 +539,15 @@ def run():
             )
             return
 
-    _detect_devices()
+    # vLLM's native hidden-state extraction runs in a forked engine process when
+    # CUDA has not been initialized yet.  If the CLI touches CUDA first
+    # (device memory query or CUDA seeding), vLLM must switch to spawn, which
+    # loses runtime compatibility shims installed in this process.
+    _defer_cuda_setup = (
+        config.model.backend in ("vllm", "sglang") and _vllm_hidden_states_available()
+    )
+    if not _defer_cuda_setup:
+        _detect_devices()
     _configure_libraries()
 
     # Resolve + apply the global seed (random/numpy/torch) for reproducibility.
@@ -547,7 +555,8 @@ def run():
     _seed_was_random = config.seed is None
     if _seed_was_random:
         config.seed = random.randint(0, 2**31 - 1)
-    set_seed(config.seed)
+    if not _defer_cuda_setup:
+        set_seed(config.seed)
     print(
         f"Global seed: [bold]{config.seed}[/]"
         + (" [grey50](randomly chosen)[/]" if _seed_was_random else "")
@@ -674,6 +683,10 @@ def run():
             "  Phase 1 will use HF pipeline parallelism (~4 tok/s — 10-15x slower)."
         )
         print()
+
+    if _defer_cuda_setup:
+        _detect_devices()
+        set_seed(config.seed)
 
     # When speculators handled hidden state extraction AND we're using a TP
     # backend, the HF model is not needed for Phase 1 at all.  Skip loading
