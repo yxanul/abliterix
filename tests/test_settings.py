@@ -69,6 +69,8 @@ def test_kl_config_defaults():
 def test_detection_config_defaults():
     cfg = DetectionConfig()
     assert cfg.llm_judge is True
+    assert cfg.llm_judge_audit_log is True
+    assert cfg.llm_judge_audit_log_file == "judge_audit.jsonl"
     assert len(cfg.compliance_markers) > 0
     assert "sorry" in cfg.compliance_markers
 

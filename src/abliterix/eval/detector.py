@@ -101,6 +101,30 @@ class ClassificationCache:
         self._conn.close()
 
 
+class JudgeAuditLog:
+    """Append-only JSONL audit log for live LLM judge API calls."""
+
+    def __init__(self, checkpoint_dir: str, log_file: str):
+        self._path = (
+            log_file
+            if os.path.isabs(log_file)
+            else os.path.join(checkpoint_dir, log_file)
+        )
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+
+    def write(self, record: dict):
+        payload = {
+            "schema_version": 1,
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **record,
+        }
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Refusal detector
 # ---------------------------------------------------------------------------
@@ -291,6 +315,8 @@ class RefusalDetector:
     def __init__(self, config: AbliterixConfig):
         self.config = config
         self._cache: ClassificationCache | None = None
+        self._audit_log: JudgeAuditLog | None = None
+        self._audit_log_warning_shown = False
 
         if config.detection.llm_judge:
             api_key = _resolve_judge_api_key(config)
@@ -313,6 +339,11 @@ class RefusalDetector:
                 config.detection.llm_judge_model,
                 prompt_hash,
             )
+            if config.detection.llm_judge_audit_log:
+                self._audit_log = JudgeAuditLog(
+                    config.optimization.checkpoint_dir,
+                    config.detection.llm_judge_audit_log_file,
+                )
 
     def close(self):
         """Release the classification cache connection."""
@@ -322,6 +353,16 @@ class RefusalDetector:
 
     def __del__(self):
         self.close()
+
+    def _write_judge_audit(self, record: dict) -> None:
+        if self._audit_log is None:
+            return
+        try:
+            self._audit_log.write(record)
+        except OSError as exc:
+            if not self._audit_log_warning_shown:
+                print(f"[yellow]Warning: failed to write LLM judge audit log: {exc}[/]")
+                self._audit_log_warning_shown = True
 
     # ------------------------------------------------------------------
     # Public API
@@ -669,6 +710,31 @@ class RefusalDetector:
             headers["HTTP-Referer"] = "https://github.com/wuwangzhang1216/abliterix"
             headers["X-Title"] = "abliterix"
 
+        def _audit_items(
+            labels: list[str] | None = None,
+            verdicts: list[bool] | None = None,
+        ) -> list[dict]:
+            items: list[dict] = []
+            for j, orig_idx in enumerate(uncached):
+                q_full, r_full = batch[orig_idx]
+                q_sent, r_sent = truncated[orig_idx]
+                item = {
+                    "request_index": j + 1,
+                    "batch_index": orig_idx,
+                    "prompt": q_sent,
+                    "response": r_sent,
+                    "prompt_truncated": len(q_full) > len(q_sent),
+                    "response_truncated": len(r_full) > len(r_sent),
+                    "prompt_chars": len(q_full),
+                    "response_chars": len(r_full),
+                }
+                if labels is not None and j < len(labels):
+                    item["label"] = labels[j]
+                if verdicts is not None and j < len(verdicts):
+                    item["is_refusal"] = verdicts[j]
+                items.append(item)
+            return items
+
         for attempt in range(3):
             try:
                 req = urllib.request.Request(
@@ -694,6 +760,7 @@ class RefusalDetector:
                 classifications = (
                     parsed["labels"] if isinstance(parsed, dict) else parsed
                 )
+                raw_classifications = [str(c) for c in classifications]
                 # Some judge models (esp. Claude) occasionally drop or merge
                 # entries in a batch, so the returned array is shorter than
                 # expected.  Rather than crash the entire run, pad with
@@ -713,7 +780,33 @@ class RefusalDetector:
                     else:
                         classifications = classifications[: len(uncached)]
 
-                api_res = [c.upper().startswith("R") for c in classifications]
+                labels = [str(c) for c in classifications]
+                api_res = [c.upper().startswith("R") for c in labels]
+
+                choice0 = data.get("choices", [{}])[0]
+                self._write_judge_audit(
+                    {
+                        "event": "llm_judge_api_call",
+                        "status": "success",
+                        "attempt": attempt + 1,
+                        "endpoint_url": endpoint_url,
+                        "is_openrouter": is_openrouter,
+                        "model": self.config.detection.llm_judge_model,
+                        "request": request_body,
+                        "response": {
+                            "id": data.get("id"),
+                            "model": data.get("model"),
+                            "finish_reason": choice0.get("finish_reason"),
+                            "usage": data.get("usage"),
+                            "raw_content": raw_content,
+                            "json_content": content,
+                        },
+                        "parsed_labels": labels,
+                        "raw_parsed_labels": raw_classifications,
+                        "uncached_indices": uncached,
+                        "items": _audit_items(labels, api_res),
+                    }
+                )
 
                 for j, orig_idx in enumerate(uncached):
                     results[orig_idx] = api_res[j]
@@ -725,6 +818,23 @@ class RefusalDetector:
 
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 if attempt < 2:
+                    self._write_judge_audit(
+                        {
+                            "event": "llm_judge_api_call",
+                            "status": "retryable_error",
+                            "attempt": attempt + 1,
+                            "endpoint_url": endpoint_url,
+                            "is_openrouter": is_openrouter,
+                            "model": self.config.detection.llm_judge_model,
+                            "request": request_body,
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                            "uncached_indices": uncached,
+                            "items": _audit_items(),
+                        }
+                    )
                     time.sleep(2 ** (attempt + 1))
                 else:
                     # Last-resort graceful fallback: default every item in the
@@ -735,6 +845,29 @@ class RefusalDetector:
                     print(
                         f"[yellow]Warning: LLM judge failed after 3 attempts "
                         f"({exc}); marking batch of {len(uncached)} as all R.[/]"
+                    )
+                    fallback_labels = ["R"] * len(uncached)
+                    fallback_verdicts = [True] * len(uncached)
+                    self._write_judge_audit(
+                        {
+                            "event": "llm_judge_api_call",
+                            "status": "fallback_refusal",
+                            "attempt": attempt + 1,
+                            "endpoint_url": endpoint_url,
+                            "is_openrouter": is_openrouter,
+                            "model": self.config.detection.llm_judge_model,
+                            "request": request_body,
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                            "parsed_labels": fallback_labels,
+                            "uncached_indices": uncached,
+                            "items": _audit_items(
+                                fallback_labels,
+                                fallback_verdicts,
+                            ),
+                        }
                     )
                     for j, orig_idx in enumerate(uncached):
                         results[orig_idx] = True  # True = refusal

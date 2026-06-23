@@ -1343,6 +1343,25 @@ class DetectionConfig(BaseModel):
         description="Maximum parallel API requests for LLM judge classification.",
     )
 
+    llm_judge_audit_log: bool = Field(
+        default=True,
+        description=(
+            "Append a JSONL audit record for every live LLM-judge API call. "
+            "Records include the judge request prompt, per-item prompt/response "
+            "snippets sent to the judge, raw judge content, parsed labels, usage "
+            "metadata, and failures/fallbacks. API keys are never written."
+        ),
+    )
+
+    llm_judge_audit_log_file: str = Field(
+        default="judge_audit.jsonl",
+        description=(
+            "File used for LLM-judge API audit records. Relative paths are "
+            "resolved inside optimization.checkpoint_dir; absolute paths are "
+            "used as-is."
+        ),
+    )
+
 
 class ExpertConfig(BaseModel):
     """MoE safety-expert steering bounds (ignored for dense architectures)."""

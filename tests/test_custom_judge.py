@@ -99,6 +99,8 @@ def test_new_fields_have_stable_defaults():
     assert d.llm_judge_reasoning_budget is None
     assert d.llm_judge_auth_header == "Authorization"
     assert d.llm_judge_auth_prefix == "Bearer "
+    assert d.llm_judge_audit_log is True
+    assert d.llm_judge_audit_log_file == "judge_audit.jsonl"
 
 
 def test_config_accepts_openai_preset():
@@ -192,6 +194,7 @@ def _openrouter_detector(monkeypatch) -> RefusalDetector:
     monkeypatch.delenv("LLM_JUDGE_API_KEY", raising=False)
     detector = RefusalDetector(AbliterixConfig())
     detector._cache = None
+    detector._audit_log = None
     return detector
 
 
@@ -209,6 +212,7 @@ def _minimax_detector(monkeypatch) -> RefusalDetector:
     )
     detector = RefusalDetector(config)
     detector._cache = None
+    detector._audit_log = None
     return detector
 
 
@@ -224,6 +228,7 @@ def _vllm_detector(monkeypatch) -> RefusalDetector:
     )
     detector = RefusalDetector(config)
     detector._cache = None
+    detector._audit_log = None
     return detector
 
 
@@ -264,6 +269,47 @@ def test_openrouter_request_skips_reasoning_budget(monkeypatch):
     with _patch_urlopen(_judge_response(["R"]), captured):
         detector._query_judge_api([("q", "r")])
     assert captured["body"]["max_tokens"] == 55
+
+
+def test_openrouter_judge_audit_log_records_request_and_answer(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret-key")
+    config = AbliterixConfig(
+        optimization={"checkpoint_dir": str(tmp_path)},
+        detection={"llm_judge_model": "deepseek/deepseek-v4-flash"},
+    )
+    detector = RefusalDetector(config)
+    detector._cache = None
+
+    captured: dict = {}
+    with _patch_urlopen(_judge_response(["R", "C"]), captured):
+        result = detector._query_judge_api([("q1", "r1"), ("q2", "r2")])
+
+    assert result == [True, False]
+    audit_path = tmp_path / "judge_audit.jsonl"
+    text = audit_path.read_text(encoding="utf-8")
+    assert "or-secret-key" not in text
+
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["schema_version"] == 1
+    assert row["event"] == "llm_judge_api_call"
+    assert row["status"] == "success"
+    assert row["is_openrouter"] is True
+    assert row["model"] == "deepseek/deepseek-v4-flash"
+    assert "openrouter.ai" in row["endpoint_url"]
+    assert row["request"]["model"] == "deepseek/deepseek-v4-flash"
+    assert "messages" in row["request"]
+    assert row["response"]["raw_content"] == json.dumps({"labels": ["R", "C"]})
+    assert row["parsed_labels"] == ["R", "C"]
+    assert row["items"][0]["prompt"] == "q1"
+    assert row["items"][0]["response"] == "r1"
+    assert row["items"][0]["label"] == "R"
+    assert row["items"][0]["is_refusal"] is True
+    assert row["items"][1]["label"] == "C"
+    assert row["items"][1]["is_refusal"] is False
 
 
 # --- MiniMax preset --------------------------------------------------------
@@ -450,6 +496,7 @@ def _build_detector(
         monkeypatch.setenv(k, v)
     detector = RefusalDetector(AbliterixConfig(detection=detection))
     detector._cache = None
+    detector._audit_log = None
     return detector
 
 
