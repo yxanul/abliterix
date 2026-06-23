@@ -49,7 +49,7 @@ checkpoint_dir = "checkpoints_glm47_flash_fp8_l40s_v1_match_rank8_ndir3"
 scale = 1.0
 token_count = 3
 target = 0.01
-prune_threshold = 5.0
+prune_threshold = 0.1
 
 [experts]
 max_suppress = 30
@@ -61,7 +61,7 @@ llm_judge = true
 llm_judge_model = "deepseek/deepseek-v4-flash"
 llm_judge_reasoning_budget = 2048
 llm_judge_batch_size = 5
-llm_judge_concurrency = 2
+llm_judge_concurrency = 10
 
 [display]
 print_responses = false
