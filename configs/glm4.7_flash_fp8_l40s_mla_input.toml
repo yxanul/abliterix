@@ -1,0 +1,108 @@
+# GLM-4.7-Flash FP8 Dynamic on a single L40S (48GB)
+#
+# Purpose:
+#   Re-test the FP8/vLLM LoRA lane after correcting GLM MLA attention targets.
+#   This is the first GLM proxy run where attention steering includes the live
+#   residual-input MLA projections:
+#     - attn.q_a_proj
+#     - attn.kv_a_proj_with_mqa
+#     - attn.o_proj
+#
+# Key deltas from configs/glm4.7_flash_fp8_l40s_v1_match.toml:
+#   - router suppression pinned off
+#   - KL prune threshold tightened to 0.2
+#   - global strength range lowered to [0.5, 6.0]
+#   - 40 trials / 12 warmup
+#   - explicit vLLM LoRA target modules include q_a/kv_a and MoE companions
+
+non_interactive = true
+
+[model]
+model_id = "unsloth/GLM-4.7-Flash-FP8-Dynamic"
+backend = "vllm"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+trust_remote_code = true
+use_torch_compile = false
+tensor_parallel_size = 1
+gpu_memory_utilization = 0.88
+enable_expert_parallel = false
+enforce_eager = true
+disable_lora = false
+use_in_place_editing = false
+vllm_return_routed_experts = true
+moe_backend = "triton"
+max_model_len = 2048
+max_num_seqs = 16
+vllm_max_lora_rank = 1
+lora_target_modules = [
+  "o_proj",
+  "q_a_proj",
+  "kv_a_proj_with_mqa",
+  "down_proj",
+  "gate_proj",
+  "up_proj",
+]
+
+[inference]
+batch_size = 0
+max_batch_size = 8
+max_gen_tokens = 150
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+n_directions = 1
+orthogonal_projection = true
+discriminative_layer_selection = false
+decay_kernel = "linear"
+weight_normalization = "none"
+strength_range = [0.5, 6.0]
+
+[optimization]
+num_trials = 40
+num_warmup_trials = 12
+checkpoint_dir = "checkpoints_glm47_flash_fp8_l40s_mla_input"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.2
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[detection]
+llm_judge = true
+llm_judge_model = "deepseek/deepseek-v4-flash"
+llm_judge_reasoning_budget = 2048
+llm_judge_batch_size = 5
+llm_judge_concurrency = 10
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "datasets/good_500"
+split = "train[:400]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_500"
+split = "train[:400]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_500"
+split = "train[400:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_500"
+split = "train[400:]"
+column = "prompt"
