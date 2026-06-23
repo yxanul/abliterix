@@ -145,6 +145,38 @@ def _install_glm4_moe_lite_eagle3_compat() -> None:
     glm4_lite.Glm4MoeLiteModel._abliterix_eagle3_patch = True
 
 
+def _install_glm4_moe_lite_spawn_patch() -> None:
+    """Ensure spawned vLLM engine processes install the GLM EAGLE3 shim.
+
+    vLLM switches from fork to spawn when CUDA is already initialized in the
+    CLI process.  Runtime monkeypatches are inherited through fork but not
+    spawn, so spawned EngineCore workers need a tiny startup hook.
+    """
+    existing = os.environ.get("ABLITERIX_GLM4_VLLM_PATCH_DIR")
+    if existing and os.path.exists(os.path.join(existing, "sitecustomize.py")):
+        return
+
+    patch_dir = tempfile.mkdtemp(prefix="abliterix_glm4_vllm_patch_")
+    sitecustomize = os.path.join(patch_dir, "sitecustomize.py")
+    with open(sitecustomize, "w", encoding="utf-8") as f:
+        f.write(
+            "try:\n"
+            "    from abliterix.core.vllm_hidden_states import "
+            "_install_glm4_moe_lite_eagle3_compat\n"
+            "    _install_glm4_moe_lite_eagle3_compat()\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+
+    pythonpath = os.environ.get("PYTHONPATH")
+    paths = pythonpath.split(os.pathsep) if pythonpath else []
+    if patch_dir not in paths:
+        os.environ["PYTHONPATH"] = (
+            patch_dir if not pythonpath else patch_dir + os.pathsep + pythonpath
+        )
+    os.environ["ABLITERIX_GLM4_VLLM_PATCH_DIR"] = patch_dir
+
+
 def _wait_for_hidden_states_file(path: str, timeout_s: float = 300.0) -> None:
     """Wait until vLLM's async hidden-state connector has written ``path``."""
     deadline = time.monotonic() + timeout_s
@@ -261,6 +293,7 @@ def extract_hidden_states_vllm(
     text_cfg = _load_text_config_data(model_id, trust)
     if text_cfg.get("model_type") == "glm4_moe_lite":
         _install_glm4_moe_lite_eagle3_compat()
+        _install_glm4_moe_lite_spawn_patch()
     num_layers = text_cfg["num_hidden_layers"]
     # Extract ALL layers.
     layer_ids = list(range(num_layers))
