@@ -889,7 +889,14 @@ def _interpolate_strength(
     return None if strength == 0 else strength
 
 
-_ATTN_COMPONENTS: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+_ATTN_COMPONENTS: tuple[str, ...] = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "q_b_proj",
+    "kv_b_proj",
+    "o_proj",
+)
 
 
 def _apply_direct_steering_vllm(

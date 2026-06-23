@@ -1232,6 +1232,15 @@ class ProjectionCache:
             (r"model\.layers\.(\d+)\.self_attn\.q_proj\.weight$", "attn.q_proj"),
             (r"model\.layers\.(\d+)\.self_attn\.k_proj\.weight$", "attn.k_proj"),
             (r"model\.layers\.(\d+)\.self_attn\.v_proj\.weight$", "attn.v_proj"),
+            # Multi-head Latent Attention (GLM / DeepSeek-style MLA).  These
+            # are the HF-discovered steerable projections for GLM-4.7-Flash;
+            # without them the vLLM safetensors lane silently falls back to
+            # o_proj-only attention steering.
+            (r"model\.layers\.(\d+)\.self_attn\.q_b_proj\.weight$", "attn.q_b_proj"),
+            (
+                r"model\.layers\.(\d+)\.self_attn\.kv_b_proj\.weight$",
+                "attn.kv_b_proj",
+            ),
             # mlp.down_proj: dense MLP (non-MoE layers)
             (r"model\.layers\.(\d+)\.mlp\.down_proj\.weight$", "mlp.down_proj"),
             # MoE expert down projection (w2 / down_proj) — real steering here.
@@ -1426,6 +1435,8 @@ class ProjectionCache:
                         "experts": entries,
                     }
                 else:
+                    if not entries:
+                        continue
                     # Single entry (backward-compat with non-MoE path).
                     cache.projections[layer_idx][component] = entries[0]
 

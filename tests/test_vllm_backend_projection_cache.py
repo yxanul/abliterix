@@ -184,3 +184,50 @@ def test_projection_cache_safetensors_preserves_multi_direction_projection_shape
     info = cache.projections[0]["attn.o_proj"]
     assert info["vW_all"].shape == (3, 2, 3)
     assert info["direction"] == "output"
+
+
+def test_projection_cache_safetensors_discovers_glm_mla_b_projections(
+    tmp_path, monkeypatch
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    q_b = torch.randn(4, 3)
+    kv_b = torch.randn(4, 5)
+    save_file(
+        {
+            "model.layers.0.self_attn.q_b_proj.weight": q_b,
+            "model.layers.0.self_attn.kv_b_proj.weight": kv_b,
+        },
+        model_dir / "model.safetensors",
+    )
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text_config=SimpleNamespace(num_hidden_layers=1)
+        ),
+    )
+
+    config = SimpleNamespace(
+        model=SimpleNamespace(model_id=str(model_dir), trust_remote_code=False),
+        steering=SimpleNamespace(disabled_components=set()),
+    )
+    steering_vectors = torch.eye(4)
+
+    cache = ProjectionCache.build_from_safetensors(config, steering_vectors)
+
+    assert sorted(cache.projections[0]) == ["attn.kv_b_proj", "attn.q_b_proj"]
+    q_info = cache.projections[0]["attn.q_b_proj"]
+    kv_info = cache.projections[0]["attn.kv_b_proj"]
+    assert q_info["module_path"] == "model.layers.0.self_attn.q_b_proj"
+    assert kv_info["module_path"] == "model.layers.0.self_attn.kv_b_proj"
+    assert q_info["direction"] == "output"
+    assert kv_info["direction"] == "output"
+    torch.testing.assert_close(q_info["vW_all"], q_b)
+    torch.testing.assert_close(kv_info["vW_all"], kv_b)
+    assert cache.target_modules == ["kv_b_proj", "q_b_proj"]

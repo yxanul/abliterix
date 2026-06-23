@@ -1194,26 +1194,23 @@ def run():
                 )
                 print("  * Injected 'mlp.down_proj' into steerable components (EGA)")
 
-            # If an in-place attention editor was attached, q/k/v/o_proj must
-            # all appear in cached_components so the optimizer generates
-            # steering profiles for every attention projection. ``_apply_direct_
-            # steering_vllm`` (steering.py) dispatches to VLLMAttentionEditor
-            # which handles fused qkv_proj slicing on TP workers — but only if
-            # the profiles exist. Without this injection, ProjectionCache only
-            # contributes ``attn.o_proj`` (its build loop skips q/k/v because
-            # ``d_out != hidden_dim`` makes ``sv @ W`` dimensionally invalid),
-            # leaving 3/4 of attention unsteered.
+            # If an in-place attention editor was attached, the worker probe
+            # reports which attention projections exist. Inject exactly those
+            # into cached_components so the optimizer creates matching profiles.
+            # This covers both fused-qkv attention and GLM/DeepSeek-style MLA
+            # q_b/kv_b projections without sending q/k/v plans to MLA-only
+            # layers.
             if (
                 engine._cached_components is not None
                 and getattr(tp_gen, "attention_editor", None) is not None
                 and len(getattr(tp_gen.attention_editor, "_attn_layers", set())) > 0
             ):
-                _attn_needed = {
-                    "attn.q_proj",
-                    "attn.k_proj",
-                    "attn.v_proj",
-                    "attn.o_proj",
-                }
+                _supported = set(
+                    getattr(tp_gen.attention_editor, "_supported_components", set())
+                )
+                if not _supported:
+                    _supported = {"q_proj", "k_proj", "v_proj", "o_proj"}
+                _attn_needed = {f"attn.{component}" for component in _supported}
                 _attn_missing = _attn_needed - set(engine._cached_components)
                 if _attn_missing:
                     engine._cached_components = sorted(

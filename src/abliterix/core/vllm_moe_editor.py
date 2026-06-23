@@ -1093,23 +1093,49 @@ _ATTN_PATHS: tuple[str, ...] = (
 
 
 def _worker_locate_attention(layer_module: Any):
-    """Return ``(attn_module, path)`` if the layer has a fused qkv_proj
-    + o_proj pair recognisable to vLLM, else ``(None, None)``.
+    """Return ``(attn_module, path)`` if the layer has a recognisable vLLM
+    attention module, else ``(None, None)``.
 
-    The returned module must expose ``qkv_proj.weight``, ``o_proj.weight``
-    AND integer attributes ``q_size`` + ``kv_size`` so we know how to
-    slice the fused QKV tensor.
+    Supported layouts:
+      * fused QKV: ``qkv_proj.weight`` + ``q_size`` + ``kv_size``
+      * MLA: ``q_b_proj.weight`` / ``kv_b_proj.weight``
+
+    ``o_proj.weight`` is optional for discovery but required for ``o_proj``
+    edits. Some MLA implementations expose only the latent projections in the
+    worker module tree.
     """
     for path in _ATTN_PATHS:
         attn = getattr(layer_module, path, None)
         if attn is None:
             continue
-        if not hasattr(attn, "qkv_proj") or not hasattr(attn, "o_proj"):
-            continue
-        if not hasattr(attn, "q_size") or not hasattr(attn, "kv_size"):
-            continue
-        return attn, path
+        if _attention_supported_components(attn):
+            return attn, path
     return None, None
+
+
+def _weight_shape(module: Any) -> tuple[int, ...] | None:
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        return None
+    return tuple(weight.shape)
+
+
+def _attention_supported_components(attn: Any) -> tuple[str, ...]:
+    components: list[str] = []
+    if (
+        hasattr(attn, "qkv_proj")
+        and hasattr(attn, "q_size")
+        and hasattr(attn, "kv_size")
+        and _weight_shape(attn.qkv_proj) is not None
+    ):
+        components.extend(["q_proj", "k_proj", "v_proj"])
+    if hasattr(attn, "q_b_proj") and _weight_shape(attn.q_b_proj) is not None:
+        components.append("q_b_proj")
+    if hasattr(attn, "kv_b_proj") and _weight_shape(attn.kv_b_proj) is not None:
+        components.append("kv_b_proj")
+    if hasattr(attn, "o_proj") and _weight_shape(attn.o_proj) is not None:
+        components.append("o_proj")
+    return tuple(components)
 
 
 def _worker_probe_attention(worker: Any) -> dict[str, Any]:
@@ -1117,23 +1143,42 @@ def _worker_probe_attention(worker: Any) -> dict[str, Any]:
     decoder = _worker_resolve_model(worker)
     layers = decoder.layers
     per_layer: list[
-        tuple[int, str | None, tuple[int, ...] | None, tuple[int, ...] | None, int, int]
+        tuple[
+            int,
+            str | None,
+            tuple[int, ...] | None,
+            tuple[int, ...] | None,
+            int,
+            int,
+            tuple[str, ...],
+        ]
     ] = []
     for idx, layer in enumerate(layers):
         attn, path = _worker_locate_attention(layer)
         if attn is None:
-            per_layer.append((idx, None, None, None, 0, 0))
+            per_layer.append((idx, None, None, None, 0, 0, ()))
             continue
-        qkv_shape = tuple(attn.qkv_proj.weight.shape)
-        o_shape = tuple(attn.o_proj.weight.shape)
+        qkv_shape = _weight_shape(getattr(attn, "qkv_proj", None))
+        if qkv_shape is None:
+            qkv_shape = _weight_shape(getattr(attn, "q_b_proj", None))
+        o_shape = _weight_shape(getattr(attn, "o_proj", None))
+        components = _attention_supported_components(attn)
         per_layer.append(
-            (idx, path, qkv_shape, o_shape, int(attn.q_size), int(attn.kv_size))
+            (
+                idx,
+                path,
+                qkv_shape,
+                o_shape,
+                int(getattr(attn, "q_size", 0)),
+                int(getattr(attn, "kv_size", 0)),
+                components,
+            )
         )
     return {"n_layers": len(layers), "per_layer": per_layer}
 
 
 def _worker_backup_attention(worker: Any, layer_indices: list[int]) -> int:
-    """Snapshot qkv_proj + o_proj weights into CPU pinned RAM. Idempotent."""
+    """Snapshot attention projection weights into CPU pinned RAM. Idempotent."""
     import torch
 
     decoder = _worker_resolve_model(worker)
@@ -1151,17 +1196,29 @@ def _worker_backup_attention(worker: Any, layer_indices: list[int]) -> int:
         if attn is None:
             continue
 
-        qkv_w = attn.qkv_proj.weight
-        o_w = attn.o_proj.weight
-        qkv_cpu = qkv_w.data.detach().to(device="cpu", dtype=qkv_w.dtype, copy=True)
-        o_cpu = o_w.data.detach().to(device="cpu", dtype=o_w.dtype, copy=True)
+        entry: dict[str, Any] = {}
+        for key, attr in (
+            ("qkv", "qkv_proj"),
+            ("q_b", "q_b_proj"),
+            ("kv_b", "kv_b_proj"),
+            ("o", "o_proj"),
+        ):
+            module = getattr(attn, attr, None)
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                continue
+            entry[key] = weight.data.detach().to(
+                device="cpu", dtype=weight.dtype, copy=True
+            )
         if torch.cuda.is_available():
-            try:
-                qkv_cpu = qkv_cpu.pin_memory()
-                o_cpu = o_cpu.pin_memory()
-            except RuntimeError:
-                pass
-        backup[idx] = {"qkv": qkv_cpu, "o": o_cpu}
+            for key, cpu in list(entry.items()):
+                try:
+                    entry[key] = cpu.pin_memory()
+                except RuntimeError:
+                    pass
+        if not entry:
+            continue
+        backup[idx] = entry
         n_new += 1
     return n_new
 
@@ -1177,12 +1234,19 @@ def _worker_restore_attention(worker: Any) -> int:
         attn, _ = _worker_locate_attention(layer)
         if attn is None:
             continue
-        attn.qkv_proj.weight.data.copy_(
-            pair["qkv"].to(attn.qkv_proj.weight.device, non_blocking=True)
-        )
-        attn.o_proj.weight.data.copy_(
-            pair["o"].to(attn.o_proj.weight.device, non_blocking=True)
-        )
+        for key, attr in (
+            ("qkv", "qkv_proj"),
+            ("q_b", "q_b_proj"),
+            ("kv_b", "kv_b_proj"),
+            ("o", "o_proj"),
+        ):
+            if key not in pair:
+                continue
+            module = getattr(attn, attr, None)
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                continue
+            weight.data.copy_(pair[key].to(weight.device, non_blocking=True))
         n += 1
     return n
 
@@ -1235,7 +1299,8 @@ def _worker_apply_attn_batch(
 
     ``plan`` entries:
       * ``layer_idx`` (int)
-      * ``component`` (one of ``"q_proj"``, ``"k_proj"``, ``"v_proj"``, ``"o_proj"``)
+      * ``component`` (one of ``"q_proj"``, ``"k_proj"``, ``"v_proj"``,
+        ``"q_b_proj"``, ``"kv_b_proj"``, ``"o_proj"``)
       * ``v`` (bytes — torch.save of 1-D hidden-dim float tensor)
       * ``strength`` (float)
 
@@ -1270,6 +1335,9 @@ def _worker_apply_attn_batch(
             continue
 
         if component == "o_proj":
+            if not hasattr(attn, "o_proj"):
+                errors.append(f"layer {idx} o_proj: module not found")
+                continue
             W = attn.o_proj.weight.data
             device = W.device
             vf = v.to(device=device, dtype=torch.float32)
@@ -1283,9 +1351,32 @@ def _worker_apply_attn_batch(
                 errors.append(f"layer {idx} o_proj: {e}")
             continue
 
+        if component in ("q_b_proj", "kv_b_proj"):
+            module = getattr(attn, component, None)
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                errors.append(f"layer {idx} {component}: module not found")
+                continue
+            W = weight.data
+            device = W.device
+            vf = v.to(device=device, dtype=torch.float32)
+            try:
+                with torch.no_grad():
+                    W_new = _project_2d(W, vf, strength, norm_preserve)
+                    weight.data.copy_(W_new)
+                applied += 1
+                per_layer.append((idx, component, (W.shape[0], W.shape[1])))
+            except ValueError as e:
+                errors.append(f"layer {idx} {component}: {e}")
+            continue
+
         # q_proj / k_proj / v_proj — slice the fused QKV weight.
         if component not in ("q_proj", "k_proj", "v_proj"):
             errors.append(f"layer {idx}: unknown component {component!r}")
+            continue
+
+        if not hasattr(attn, "qkv_proj"):
+            errors.append(f"layer {idx} {component}: qkv_proj module not found")
             continue
 
         qkv_w = attn.qkv_proj.weight
@@ -1343,6 +1434,7 @@ class VLLMAttentionEditor:
         # Cached sizes from probe — used only for diagnostic printing.
         self._last_q_size = 0
         self._last_kv_size = 0
+        self._supported_components: set[str] = set()
 
     def _rpc(self, fn, args: tuple = ()):
         return self.llm.llm_engine.collective_rpc(fn, args=args)
@@ -1356,27 +1448,39 @@ class VLLMAttentionEditor:
         info = results[0]
         n_layers = info["n_layers"]
         found = [
-            (i, p, tuple(qs), tuple(os_), q, kv)
-            for (i, p, qs, os_, q, kv) in info["per_layer"]
+            (
+                i,
+                p,
+                tuple(qs) if qs is not None else None,
+                tuple(os_) if os_ is not None else None,
+                q,
+                kv,
+                tuple(components),
+            )
+            for (i, p, qs, os_, q, kv, components) in info["per_layer"]
             if p is not None
         ]
         self._attn_layers = {i for (i, *_rest) in found}
+        self._supported_components = {
+            component for item in found for component in item[6]
+        }
         if not found:
             print(
                 "  [yellow]VLLMAttentionEditor.probe: no attention modules found "
-                "(expected self_attn.qkv_proj + self_attn.o_proj).[/]"
+                "(expected fused qkv/o_proj or MLA q_b/kv_b/o_proj).[/]"
             )
             self._probed = True
             return
         first = found[0]
         self._last_q_size = first[4]
         self._last_kv_size = first[5]
-        qkv_shapes = sorted({qs for (_, _, qs, _os, _q, _k) in found})
-        o_shapes = sorted({os_ for (_, _, _qs, os_, _q, _k) in found})
+        qkv_shapes = sorted({qs for (_, _, qs, _os, _q, _k, _c) in found if qs})
+        o_shapes = sorted({os_ for (_, _, _qs, os_, _q, _k, _c) in found if os_})
         print(
             f"  [dim]VLLMAttentionEditor.probe: {len(found)}/{n_layers} layers "
             f"expose self_attn. qkv shapes={qkv_shapes}, o shapes={o_shapes}, "
-            f"q_size={self._last_q_size}, kv_size={self._last_kv_size}[/]"
+            f"q_size={self._last_q_size}, kv_size={self._last_kv_size}, "
+            f"components={sorted(self._supported_components)}[/]"
         )
         self._probed = True
 
