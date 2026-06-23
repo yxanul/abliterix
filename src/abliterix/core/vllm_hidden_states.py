@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from itertools import islice
 from typing import Any
 
 import torch
@@ -46,6 +48,7 @@ _SUPPORTED_MODEL_TYPES = {
     "kimi_k25",
     "gemma4",
     "gemma4_text",
+    "glm4_moe_lite",
     # "minimax_m2" — disabled: vLLM 0.19.1's extract_hidden_states path on
     # MiniMax-M2 (62 layers × eagle_aux_hidden_state hooks) deadlocks after
     # NCCL init on Blackwell PCIe (sm_120 RTX PRO 6000) — workers spin at
@@ -55,6 +58,125 @@ _SUPPORTED_MODEL_TYPES = {
     # (tracked in issue #33041 + related MiniMax extract_hidden_states).
     # "step3p5" — similar incompatibility; falls back to HF PP.
 }
+
+
+def _install_glm4_moe_lite_eagle3_compat() -> None:
+    """Add vLLM EAGLE3 hidden-state hooks for GLM-4.7 Flash.
+
+    vLLM can run ``Glm4MoeLiteForCausalLM`` normally, but as of the tested
+    v0.23 nightly its model class does not advertise the EAGLE3 interface used
+    by ``extract_hidden_states``.  The implementation is structurally the same
+    as the DeepSeek/Qwen MoE models that already support it: collect selected
+    residual-stream tensors during ``model.forward`` and return them alongside
+    the final hidden state.
+    """
+    try:
+        import vllm.model_executor.models.glm4_moe_lite as glm4_lite
+        from vllm.distributed import get_pp_group
+        from vllm.sequence import IntermediateTensors
+    except Exception:
+        return
+
+    if getattr(glm4_lite.Glm4MoeLiteModel, "_abliterix_eagle3_patch", False):
+        return
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        aux_layers = set(getattr(self, "aux_hidden_state_layers", ()))
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.start_layer in aux_layers:
+            value = hidden_states + residual if residual is not None else hidden_states
+            aux_hidden_states.append(value)
+
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual = layer(positions, hidden_states, residual)
+            if layer_idx + 1 in aux_layers:
+                value = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+                aux_hidden_states.append(value)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    glm4_lite.Glm4MoeLiteForCausalLM.supports_eagle3 = True
+    glm4_lite.Glm4MoeLiteForCausalLM.has_own_lm_head = False
+    glm4_lite.Glm4MoeLiteForCausalLM.has_own_embed_tokens = False
+    glm4_lite.Glm4MoeLiteForCausalLM.set_aux_hidden_state_layers = (
+        set_aux_hidden_state_layers
+    )
+    glm4_lite.Glm4MoeLiteForCausalLM.get_eagle3_default_aux_hidden_state_layers = (
+        get_eagle3_default_aux_hidden_state_layers
+    )
+    glm4_lite.Glm4MoeLiteModel.forward = forward
+    glm4_lite.Glm4MoeLiteModel._abliterix_eagle3_patch = True
+
+
+def _wait_for_hidden_states_file(path: str, timeout_s: float = 300.0) -> None:
+    """Wait until vLLM's async hidden-state connector has written ``path``."""
+    deadline = time.monotonic() + timeout_s
+    lock_path = path + ".lock"
+
+    while True:
+        if os.path.exists(lock_path):
+            try:
+                import fcntl
+
+                with open(lock_path, "rb") as lock_file:
+                    while True:
+                        try:
+                            fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                            fcntl.flock(lock_file, fcntl.LOCK_UN)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"Timed out waiting for hidden-state lock: {path}"
+                                )
+                            time.sleep(0.05)
+            except FileNotFoundError:
+                pass
+
+        if os.path.exists(path):
+            return
+        if time.monotonic() >= deadline:
+            raise FileNotFoundError(
+                f"Hidden-state file was not written by vLLM connector: {path}"
+            )
+        time.sleep(0.05)
 
 
 def _load_text_config_data(model_id: str, trust_remote_code: bool) -> dict[str, Any]:
@@ -137,6 +259,8 @@ def extract_hidden_states_vllm(
     # Get number of layers from config. Some newly released vLLM-supported
     # models may not exist in the installed Transformers registry yet.
     text_cfg = _load_text_config_data(model_id, trust)
+    if text_cfg.get("model_type") == "glm4_moe_lite":
+        _install_glm4_moe_lite_eagle3_compat()
     num_layers = text_cfg["num_hidden_layers"]
     # Extract ALL layers.
     layer_ids = list(range(num_layers))
@@ -265,6 +389,7 @@ def extract_hidden_states_vllm(
                 f"kv_transfer_params={out.kv_transfer_params}"
             )
 
+        _wait_for_hidden_states_file(hs_path)
         with safe_open(hs_path, "pt") as f:
             hs = f.get_tensor("hidden_states")
 

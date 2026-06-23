@@ -1129,7 +1129,11 @@ class ProjectionCache:
                 qcfg = raw.get("quantization_config", {})
         if not isinstance(qcfg, dict):
             qcfg = getattr(qcfg, "__dict__", {})
-        is_fp8 = qcfg.get("quant_method") == "fp8"
+        qmethod = qcfg.get("quant_method")
+        qformat = qcfg.get("format")
+        is_fp8 = qmethod == "fp8" or (
+            qmethod == "compressed-tensors" and qformat == "float-quantized"
+        )
 
         # Load safetensors index.
         index_path = model_dir / "model.safetensors.index.json"
@@ -1298,12 +1302,10 @@ class ProjectionCache:
                         # weight_scale_inv (DeepSeek/Qwen/MiniMax) and weight_scale.
                         scale_key_inv = wkey.replace(".weight", ".weight_scale_inv")
                         scale_key_fwd = wkey.replace(".weight", ".weight_scale")
-                        is_inv = True
                         if scale_key_inv in weight_map:
                             scale_key = scale_key_inv
                         elif scale_key_fwd in weight_map:
                             scale_key = scale_key_fwd
-                            is_inv = False
                         else:
                             scale_key = None
 
@@ -1318,10 +1320,7 @@ class ProjectionCache:
                                 block_r, dim=0
                             ).repeat_interleave(block_c, dim=1)
                             s_exp = s_exp[: w_f.shape[0], : w_f.shape[1]]
-                            if is_inv:
-                                W = (w_f * s_exp).to(torch.float32)
-                            else:
-                                W = (w_f / s_exp).to(torch.float32)
+                            W = (w_f * s_exp).to(torch.float32)
                         else:
                             W = w_raw.to(torch.float32)
                     else:

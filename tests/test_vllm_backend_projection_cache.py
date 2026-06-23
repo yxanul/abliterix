@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
+from safetensors.torch import save_file
 
 from abliterix.core.vllm_backend import ProjectionCache
 
@@ -38,4 +41,65 @@ def test_projection_cache_build_accepts_plain_linear_without_base_layer():
     assert info["module_path"] == "layers.0.o_proj"
     assert info["direction"] == "output"
     assert info["vW_all"].shape == (2, 3)
+    assert cache.target_modules == ["o_proj"]
+
+
+def test_projection_cache_safetensors_dequants_compressed_tensors_weight_scale(
+    tmp_path, monkeypatch
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    weight_f32 = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    scale = torch.tensor([[0.5], [2.0]])
+    save_file(
+        {
+            "model.layers.0.self_attn.o_proj.weight": weight_f32.to(
+                torch.float8_e4m3fn
+            ),
+            "model.layers.0.self_attn.o_proj.weight_scale": scale,
+        },
+        model_dir / "model.safetensors",
+    )
+    (model_dir / "config.json").write_text(
+        """
+        {
+          "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=1,
+                quantization_config={
+                    "quant_method": "compressed-tensors",
+                    "format": "float-quantized",
+                },
+            )
+        ),
+    )
+
+    config = SimpleNamespace(
+        model=SimpleNamespace(model_id=str(model_dir), trust_remote_code=False),
+        steering=SimpleNamespace(disabled_components=set()),
+    )
+    steering_vectors = torch.eye(2)
+
+    cache = ProjectionCache.build_from_safetensors(config, steering_vectors)
+
+    info = cache.projections[0]["attn.o_proj"]
+    expected_w = weight_f32 * scale
+    torch.testing.assert_close(info["vW_all"], expected_w)
+    assert info["module_path"] == "model.layers.0.self_attn.o_proj"
+    assert info["direction"] == "output"
     assert cache.target_modules == ["o_proj"]
