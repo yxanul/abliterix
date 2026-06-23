@@ -20,11 +20,12 @@ import pytest
 from abliterix.core.vllm_backend import (
     _MLA_ARCH_FRAGMENTS,
     _build_llm_kwargs,
+    _needs_collective_rpc_env,
     _resolve_attention_backend,
     _resolve_compile_mode,
     _should_disable_custom_all_reduce,
 )
-from abliterix.settings import AbliterixConfig, ModelConfig
+from abliterix.settings import AbliterixConfig, ExpertConfig, ModelConfig
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +184,37 @@ def _make_config(**model_overrides):
     """Build an AbliterixConfig with the model fields under test, defaulting
     everything else. Avoids loading a real TOML file from disk."""
     return AbliterixConfig.model_construct(
-        model=ModelConfig(model_id="dummy/model", **model_overrides)
+        model=ModelConfig(model_id="dummy/model", **model_overrides),
+        experts=ExpertConfig(),
     )
+
+
+def test_needs_collective_rpc_env_for_router_suppression():
+    """MoE router profiling/suppression still sends callables via
+    collective_rpc, even when fused expert in-place editing is off."""
+    cfg = AbliterixConfig.model_construct(
+        model=ModelConfig(
+            model_id="dummy/model",
+            use_in_place_editing=False,
+            vllm_return_routed_experts=False,
+        ),
+        experts=ExpertConfig(max_suppress=8),
+    )
+
+    assert _needs_collective_rpc_env(cfg) is True
+
+
+def test_needs_collective_rpc_env_false_when_all_rpc_features_disabled():
+    cfg = AbliterixConfig.model_construct(
+        model=ModelConfig(
+            model_id="dummy/model",
+            use_in_place_editing=False,
+            vllm_return_routed_experts=False,
+        ),
+        experts=ExpertConfig(max_suppress=0),
+    )
+
+    assert _needs_collective_rpc_env(cfg) is False
 
 
 def test_build_llm_kwargs_default_recipe():
@@ -218,7 +248,7 @@ def test_build_llm_kwargs_default_recipe():
     # PR #21 review item 2: enforce_eager kwarg must NOT be passed —
     # compilation_config encodes the same intent and we don't want both.
     assert "enforce_eager" not in kwargs
-    # Issue #22: routed_experts replaces collective_rpc probe by default.
+    # Issue #22: routed_experts is enabled by default for safety-expert data.
     assert kwargs["enable_return_routed_experts"] is True
 
 

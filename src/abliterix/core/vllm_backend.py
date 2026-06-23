@@ -270,6 +270,16 @@ def _build_llm_kwargs(
     return kwargs
 
 
+def _needs_collective_rpc_env(config: AbliterixConfig) -> bool:
+    """Return whether this vLLM run may send Python callables via RPC."""
+
+    return bool(
+        config.model.use_in_place_editing
+        or config.model.vllm_return_routed_experts
+        or config.experts.max_suppress > 0
+    )
+
+
 def _resolve_attention_backend(
     config_override: str | None, model_arch: str
 ) -> str | None:
@@ -336,7 +346,7 @@ class VLLMGenerator:
         # Auto-set the small set of vLLM env vars needed for in-place
         # editing / collective_rpc. Idempotent and never overwrites a
         # user-set value.
-        needs_rpc = bool(config.model.use_in_place_editing)
+        needs_rpc = _needs_collective_rpc_env(config)
         written_env = ensure_vllm_env(needs_collective_rpc=needs_rpc)
         if written_env:
             print(
